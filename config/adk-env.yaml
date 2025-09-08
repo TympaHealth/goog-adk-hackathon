@@ -1,0 +1,10 @@
+name: adk
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - google-adk==1.13.0
+      - python-dotenv>=1.0.1
+      - uvicorn>=0.30.0
