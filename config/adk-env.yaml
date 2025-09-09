@@ -1,0 +1,15 @@
+name: adk-pr-reviewer
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - requests
+      - langchain-openai
+      - langchain-google-genai
+      - langchain-community
+      - pyyaml
+      - httpx
+      - google-adk
