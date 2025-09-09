@@ -277,3 +277,29 @@ if __name__ == "__main__":
     agent = PRReviewerAgent(**cfg)
     result = agent.run(pr_number=args.pr)
     print(json.dumps(result, indent=2))
+
+
+from google.adk.agents import Agent
+
+# A simple wrapper function so ADK can call into your PRReviewerAgent
+def review_pull_request(pr_number: int = 1) -> dict:
+    """
+    Run the PR reviewer in dry_run mode.
+    Defaults to PR #1 if no number is given.
+    """
+    cfg = _config_from_env()
+    agent = PRReviewerAgent(**cfg)
+    return agent.run(pr_number=pr_number)
+
+# Expose the root agent to ADK
+root_agent = Agent(
+    name="github_agent",
+    model="gemini-2.0-flash",
+    description="Performs first-pass PR review using heuristics or Gemini.",
+    instruction=(
+        "When asked to review a PR, call the review_pull_request tool with the PR number. "
+        "Summarize results clearly for the developer."
+    ),
+    tools=[review_pull_request],
+)
+
