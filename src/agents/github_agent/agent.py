@@ -3,10 +3,11 @@ import os
 import re
 import json
 import base64
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 import requests
 from google.adk.agents import Agent
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Repo / token normalization
@@ -140,6 +141,156 @@ def _gather_diff_snippets(files: List[Dict[str, Any]], max_files: int = 30, max_
 
 
 # ───────────────────────────────────────────────────────────────────────────────
+# Unified diff parsing + static checks
+# ───────────────────────────────────────────────────────────────────────────────
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+def _iter_added_lines(patch: str) -> Iterable[Tuple[int, str]]:
+    """
+    Yield (new_line_number, added_line_text) from a unified diff patch.
+    """
+    new_line = None
+    for raw in patch.splitlines():
+        if raw.startswith('@@'):
+            m = _HUNK_RE.match(raw)
+            if m:
+                start = int(m.group(1))
+                new_line = start
+            continue
+        if new_line is None:
+            continue
+        if raw.startswith('+') and not raw.startswith('+++'):
+            yield new_line, raw[1:]
+            new_line += 1
+        elif raw.startswith('-') and not raw.startswith('---'):
+            # deletion: does not advance new_line
+            pass
+        else:
+            # context
+            new_line += 1
+
+# Patterns
+_SECRET_PATTERNS = [
+    ("S0", r"AKIA[0-9A-Z]{16}", "Possible AWS Access Key ID detected."),
+    ("S0", r"-----BEGIN (?:RSA |DSA |EC )?PRIVATE KEY-----", "Private key material committed."),
+    ("S1", r"sk-[A-Za-z0-9]{20,}", "Token that looks like a secret (sk-...)."),
+    ("S1", r"AIza[0-9A-Za-z\-_]{35}", "String that looks like a Google API key."),
+    ("S1", r"(?:api[_-]?key|token|secret)\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}['\"]", "Hard-coded credential-like value."),
+]
+
+_INSECURE_PATTERNS = [
+    ("S1", r"\bsubprocess\.(?:run|Popen|call)\s*\([^)]*shell\s*=\s*True", "Use of shell=True can allow injection; prefer shell=False and an args list."),
+    ("S1", r"\beval\s*\(", "Use of eval() is dangerous; prefer safer alternatives (e.g., ast.literal_eval for simple types)."),
+    ("S1", r"\bexec\s*\(", "Use of exec() is dangerous; avoid if possible."),
+    ("S1", r"\byaml\.load\s*\(", "yaml.load() without SafeLoader is unsafe; use yaml.safe_load()."),
+    ("S1", r"\bpickle\.loads?\s*\(", "Unpickling untrusted data is unsafe; avoid or validate source."),
+    ("S1", r"requests\.(?:get|post|put|delete)\([^)]*verify\s*=\s*False", "TLS verification disabled; remove verify=False."),
+    ("S2", r"hashlib\.md5\s*\(", "MD5 is weak; prefer SHA-256."),
+]
+
+_DEBUG_PATTERNS = [
+    ("S2", r"\bpdb\.set_trace\s*\(", "Leftover debugger call."),
+    ("S2", r"\bdebugger\s*;", "Leftover JS debugger statement."),
+    ("S3", r"\bconsole\.log\s*\(", "console.log in committed code; consider proper logging."),
+    ("S3", r"\bprint\s*\(", "print in library code; consider logging."),
+]
+
+_TODO_PATTERNS = [
+    ("S3", r"\b(?:TODO|FIXME|HACK)\b", "Found a TODO/FIXME/HACK marker; ensure it's tracked."),
+]
+
+def _suggestion_for_line(path: str, line: str) -> Optional[str]:
+    """
+    Return a GitHub suggestion block for simple cases.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    # yaml.load -> yaml.safe_load
+    if re.search(r"\byaml\.load\s*\(", line):
+        return "```suggestion\n" + re.sub(r"\byaml\.load\s*\(", "yaml.safe_load(", line) + "\n```"
+    # requests verify=False -> verify=True (conservative)
+    if re.search(r"requests\.(?:get|post|put|delete)\([^)]*verify\s*=\s*False", line):
+        return "```suggestion\n" + re.sub(r"verify\s*=\s*False", "verify=True", line) + "\n```"
+    # eval -> ast.literal_eval (simple substitution)
+    if re.search(r"\beval\s*\(", line):
+        return "```suggestion\n" + re.sub(r"\beval\s*\(", "ast.literal_eval(", line) + "\n```"
+    # print -> logging.debug for Python
+    if ext in {".py"} and re.search(r"\bprint\s*\(", line):
+        return "```suggestion\n" + re.sub(r"\bprint\s*\(", "logging.debug(", line) + "\n```"
+    # console.log -> console.debug for JS/TS
+    if ext in {".js", ".jsx", ".ts", ".tsx"} and re.search(r"\bconsole\.log\s*\(", line):
+        return "```suggestion\n" + re.sub(r"\bconsole\.log\s*\(", "console.debug(", line) + "\n```"
+    # subprocess shell=True -> shell=False (best-effort)
+    if re.search(r"\bsubprocess\.(?:run|Popen|call)\s*\([^)]*shell\s*=\s*True", line):
+        return "```suggestion\n" + re.sub(r"shell\s*=\s*True", "shell=False", line) + "\n```"
+    return None
+
+def _run_static_checks_on_patch(path: str, patch: str) -> List[Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    ext = os.path.splitext(path)[1].lower()
+    for new_line_no, text in _iter_added_lines(patch):
+        # Long line
+        if len(text) > 120:
+            findings.append({
+                "severity": "S3",
+                "type": "style/long-line",
+                "file": path,
+                "line": new_line_no,
+                "message": f"Line length {len(text)} > 120; consider wrapping.",
+                "suggestion": None,
+            })
+        # Secrets
+        for sev, pat, msg in _SECRET_PATTERNS:
+            if re.search(pat, text):
+                findings.append({
+                    "severity": sev,
+                    "type": "secret",
+                    "file": path,
+                    "line": new_line_no,
+                    "message": msg,
+                    "suggestion": None,
+                })
+        # Insecure
+        for sev, pat, msg in _INSECURE_PATTERNS:
+            if re.search(pat, text):
+                findings.append({
+                    "severity": sev,
+                    "type": "insecure",
+                    "file": path,
+                    "line": new_line_no,
+                    "message": msg,
+                    "suggestion": _suggestion_for_line(path, text),
+                })
+        # Debug leftovers
+        for sev, pat, msg in _DEBUG_PATTERNS:
+            # Only warn print in Python, console.log in JS/TS
+            if "print" in pat and ext not in {".py"}:
+                continue
+            if "console\\.log" in pat and ext not in {".js", ".jsx", ".ts", ".tsx"}:
+                continue
+            if re.search(pat, text):
+                findings.append({
+                    "severity": sev,
+                    "type": "debug",
+                    "file": path,
+                    "line": new_line_no,
+                    "message": msg,
+                    "suggestion": _suggestion_for_line(path, text),
+                })
+        # TODO/FIXME
+        for sev, pat, msg in _TODO_PATTERNS:
+            if re.search(pat, text):
+                findings.append({
+                    "severity": sev,
+                    "type": "todo",
+                    "file": path,
+                    "line": new_line_no,
+                    "message": msg,
+                    "suggestion": None,
+                })
+    return findings
+
+
+# ───────────────────────────────────────────────────────────────────────────────
 # Tools exposed to the agent
 # ───────────────────────────────────────────────────────────────────────────────
 def get_runtime_config() -> dict:
@@ -163,7 +314,6 @@ def list_open_prs_tool(limit: int) -> dict:
     try:
         gh = GitHubClient(token=token, repo=repo)
         prs = gh.list_open_prs()
-        # sort desc by number so 'latest' is first
         prs_sorted = sorted(prs, key=lambda p: p.get("number", 0), reverse=True)
         return {
             "status": "success",
@@ -226,6 +376,39 @@ def prepare_bug_review(pr_number: int, include_file_blobs: bool) -> dict:
         return {"status": "error", "message": f"GitHub API error: {e}"}
 
 
+def run_static_checks_tool(pr_number: int) -> dict:
+    """
+    Run lightweight static checks on ADDED LINES in the PR diff.
+    Returns structured findings and simple suggestion blocks for trivial fixes.
+    """
+    repo = os.getenv("GITHUB_REPO", "")
+    token = os.getenv("GITHUB_TOKEN", "")
+    try:
+        gh = GitHubClient(token=token, repo=repo)
+        files = gh.list_pr_files(pr_number)
+        findings: List[Dict[str, Any]] = []
+        for f in files:
+            patch = f.get("patch") or ""
+            path = f.get("filename") or ""
+            if not patch or not path:
+                continue
+            findings.extend(_run_static_checks_on_patch(path, patch))
+
+        # Sort findings: S0->S3 then by file/line
+        sev_order = {"S0": 0, "S1": 1, "S2": 2, "S3": 3}
+        findings.sort(key=lambda x: (sev_order.get(x["severity"], 99), x["file"], x["line"]))
+        return {"status": "success", "repo": _normalize_repo(repo), "pr_number": pr_number, "findings": findings}
+    except ValueError as e:
+        return {"status": "error", "message": str(e), "hint": "Set GITHUB_TOKEN and valid GITHUB_REPO slug."}
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", None)
+        if code == 403:
+            return {"status": "error", "message": "Forbidden when reading PR files (need Pull requests: Read)."}
+        if code == 404:
+            return {"status": "error", "message": "PR not found (or token lacks access)."}
+        return {"status": "error", "message": f"GitHub API error: {e}"}
+
+
 def post_review_comment_safe(pr_number: int, body: str) -> dict:
     """
     Try to post a single summary comment to the PR.
@@ -257,29 +440,33 @@ def post_review_comment_safe(pr_number: int, body: str) -> dict:
 root_agent = Agent(
     name="github_agent",
     model="gemini-2.0-flash",
-    description="Software Bug Assistant: automatically picks a PR, analyzes diffs for bugs/regressions/security, and posts a summary when allowed.",
+    description="Software Bug Assistant: automatically picks a PR, analyzes diffs, runs static checks (secrets/insecure/debug/TODO), and posts a summary when allowed.",
     instruction=(
         "You are an autonomous PR reviewer.\n"
         "\n"
-        "When the user asks for a review (even without a PR number):\n"
-        "1) Call get_runtime_config() to read the mode (dry_run or summary_comment).\n"
-        "2) Call list_open_prs_tool(limit=10). If there is at least one open PR and the user didn't specify a number, pick the most recent (highest PR number).\n"
-        "3) Call prepare_bug_review(pr_number=<chosen>, include_file_blobs=false). Use only diffs by default; request blobs only if essential.\n"
-        "4) Read 'analysis_prompt' (and 'blobs' if present) and write the full review:\n"
-        "   - Start with a single-line risk tier: S0/S1/S2/S3 with short rationale.\n"
-        "   - Provide a numbered list of concrete, testable findings with file:line references.\n"
-        "   - Include GitHub suggestion blocks for trivial fixes, e.g.:\n"
-        "     ```suggestion\n"
-        "     corrected line here\n"
-        "     ```\n"
-        "   - Note missing tests/docs, secret/security risks, and possible regressions.\n"
-        "5) If mode == 'summary_comment', attempt to persist the summary:\n"
-        "   - Call post_review_comment_safe(pr_number=<chosen>, body=<your concise summary + key fixes>). If it returns posted:false, DO NOT show an error—just say you couldn't post due to permissions and include the full review in the chat.\n"
+        "When asked to review (even without a PR number):\n"
+        "1) Call get_runtime_config() to see mode (dry_run or summary_comment).\n"
+        "2) Call list_open_prs_tool(limit=10). If the user did not specify a PR, pick the most recent (highest number).\n"
+        "3) Call prepare_bug_review(pr_number=<chosen>, include_file_blobs=false) to get 'analysis_prompt' and context.\n"
+        "4) Call run_static_checks_tool(pr_number=<chosen>) and merge those findings into your review.\n"
+        "5) Write the full review:\n"
+        "   - Start with a one-line risk tier (S0/S1/S2/S3) with short rationale.\n"
+        "   - Provide a numbered list of concrete findings with file:line.\n"
+        "   - Where provided in static checks, include GitHub ```suggestion blocks```.\n"
+        "   - Note missing tests/docs, secrets/security risks, and potential regressions.\n"
+        "6) If mode == 'summary_comment', try to persist the summary via post_review_comment_safe().\n"
+        "   - If posting returns posted:false (403), do not error—explain briefly and show the full review in chat.\n"
         "\n"
         "Rules:\n"
-        "- Never include any secret-like strings or credentials in the output.\n"
-        "- If any tool returns an error, continue with whatever context you have and still provide a useful review.\n"
-        "- Keep the review concise and actionable; focus on changed code.\n"
+        "- Never include any secret-like strings in your output.\n"
+        "- Continue with partial context if a tool errors; still produce a useful review.\n"
+        "- Keep things concise and actionable; focus on changed code.\n"
     ),
-    tools=[get_runtime_config, list_open_prs_tool, prepare_bug_review, post_review_comment_safe],
+    tools=[
+        get_runtime_config,
+        list_open_prs_tool,
+        prepare_bug_review,
+        run_static_checks_tool,
+        post_review_comment_safe,
+    ],
 )
